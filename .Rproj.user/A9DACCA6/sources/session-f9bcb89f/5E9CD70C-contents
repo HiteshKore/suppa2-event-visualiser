@@ -1,0 +1,1085 @@
+#!/usr/bin/env Rscript
+# ============================================================
+# suppa2_arc_plot_refactored.R
+#
+# LeafCutter-style arc plots from SUPPA2 output, for BOTH
+# skipped-exon (SE) and retained-intron (RI) events, with a
+# GTF-aligned genomic axis and a transcript track underneath.
+#
+# STRUCTURE OF THIS FILE
+#   1. Libraries
+#   2. Generic SUPPA2 event-ID parsing (works for any 4-coordinate
+#      event: SE, RI, A5, A3 -- all share this coordinate shape)
+#   3. Event-type-specific arc/block builders
+#        - SE: two inclusion arcs (shared PSI) + one reconstructed
+#              exclusion arc (1 - PSI)
+#        - RI: one spliced-junction arc (1 - PSI) + one retention
+#              block drawn on the gene line (PSI)
+#   4. Arc geometry (shared by both event types)
+#   5. GTF helpers: gene exon structure, genomic->display axis,
+#      transcript fetching, affected-exon tagging
+#   6. Plotting: one condition panel, one transcript track,
+#      one full per-event figure (dispatches SE vs RI internally)
+#   7. Main script: load SUPPA2 files, build events, build GTF
+#      axis, loop over events and save one figure per event
+#
+# KEY IDEA: for a 4-coordinate SUPPA2 event, c1 < c2 < c3 < c4.
+#   SE -> c1,c2 = upstream junction ; c2,c3 = the skipped exon
+#         (NOT a junction)         ; c3,c4 = downstream junction
+#   RI -> c1,c2 = upstream exon (not drawn as a junction)
+#         c2,c3 = the retained INTRON (the one real junction/
+#         retention span)          ; c3,c4 = downstream exon
+# Both event types reuse the SAME generic coordinate collapse in
+# section 2/7 -- only the arc/block builders in section 3 differ.
+# ============================================================
+
+# ------------------------------------------------------------
+# 1. LIBRARIES
+#    dplyr is loaded LAST so its verbs (select/filter/slice) win
+#    over same-named functions from Bioconductor GTF packages.
+# ------------------------------------------------------------
+suppressPackageStartupMessages({
+  library(data.table)
+  library(optparse)
+  library(rtracklayer)
+  library(stringr)
+  library(ggplot2)
+  library(patchwork)
+  library(tidyr)
+  library(dplyr)
+})
+
+# ============================================================
+# 2. GENERIC SUPPA2 EVENT-ID PARSING
+#    Format: <gene_id>;<event_type>:<chr>:<c1>-<c2>:<c3>-<c4>:<strand>
+#    This works identically for SE and RI event IDs -- both have
+#    exactly two "start-end" coordinate blocks. What differs is
+#    only how those 4 coordinates get INTERPRETED later.
+# ============================================================
+
+get_gene_name <- function(gtf, gene_id_val) {
+  hit <- gtf[gtf$gene_id == gene_id_val]   # drop the type == "gene" filter
+  if (length(hit) == 0 || is.null(hit$gene_name)) return(NA_character_)
+  unique(hit$gene_name)[1]
+}
+
+#' Parse the gene id, event type, chromosome, strand and raw
+#' coordinate blocks out of one or more SUPPA2 event_id strings.
+parse_suppa2_event_id <- function(event_id) {
+
+  parts  <- str_split(event_id, ";", simplify = TRUE)
+  gene   <- parts[, 1]
+  fields <- str_split(parts[, 2], ":", simplify = TRUE)
+  
+  event_type   <- fields[, 1]
+  chrom        <- fields[, 2]
+  strand       <- fields[, ncol(fields)]
+  coord_blocks <- fields[, 3:(ncol(fields) - 1), drop = FALSE]
+  
+  list(gene = gene, event_type = event_type, chr = chrom,
+       strand = strand, coord_blocks = coord_blocks)
+}
+
+#' Explode every event_id in an .ioe table into individual
+#' "junction" rows -- one row per pair of consecutive genomic
+#' coordinates. For a 4-coordinate event this yields 3 rows:
+#' (c1-c2), (c2-c3), (c3-c4). NOTE: not all 3 rows are real
+#' splice junctions -- see event-type-specific builders below,
+#' which reinterpret these coordinate pairs correctly per type.
+build_raw_junction_table_from_ioe <- function(ioe_dt) {
+  parsed <- parse_suppa2_event_id(ioe_dt$event_id)
+  #ENSG00000112062.12;MX:chr6:36076608-36095987:36096066-36102571:36076608-36100188:36100267-36102571:+
+  junc_list <- list()
+  for (i in seq_len(nrow(ioe_dt))) {
+    blocks <- parsed$coord_blocks[i, ]
+    blocks <- blocks[blocks != ""]
+    coords <- sort(unique(as.numeric(unlist(str_split(blocks, "-")))))
+    if (length(coords) < 2) next
+    
+    for (j in seq_len(length(coords) - 1)) {
+      junc_list[[length(junc_list) + 1]] <- data.table(
+        event_id   = ioe_dt$event_id[i],
+        gene_id    = parsed$gene[i],
+        event_type = parsed$event_type[i],
+        chr        = parsed$chr[i],
+        strand     = parsed$strand[i],
+        junc_start = coords[j],
+        junc_end   = coords[j + 1]
+      )
+    }
+  }
+  rbindlist(junc_list)
+}
+
+#' Collapse the exploded per-junction rows back down to one row
+#' per event, keeping only clean 4-coordinate events (SE/RI/A5/A3)
+#' and splitting the 4 coordinates out into c1 < c2 < c3 < c4.
+collapse_to_event_coordinates <- function(junctions_with_psi) {
+  collapsed <- junctions_with_psi %>%
+    group_by(event_id, gene_id, event_type, chr, strand) %>%
+    summarise(
+      coords    = list(sort(unique(c(junc_start, junc_end)))),
+      psi_cond1 = dplyr::first(psi_cond1),
+      psi_cond2 = dplyr::first(psi_cond2),
+      dPSI      = dplyr::first(dPSI),
+      pvalue    = dplyr::first(pvalue),
+      .groups = "drop"
+    )%>%
+     filter(lengths(coords) >= 3)          # CHANGED: was == 4, now accepts 4 or more
+   
+  # # how many coordinate columns we need overall, based on the longest event
+   max_coords <- max(lengths(collapsed$coords))
+  # dynamically build c1..cN, NA-padding events with fewer coordinates than max_coords
+   coord_matrix <- t(sapply(collapsed$coords, function(x) {
+     length(x) <- max_coords    # pads with NA if shorter than max_coords
+     x
+   }))
+   
+   
+   colnames(coord_matrix) <- paste0("c", seq_len(max_coords))
+   #print(coord_matrix)
+   collapsed %>%
+     select(-coords) %>%
+     bind_cols(as.data.frame(coord_matrix))
+}
+
+
+# ============================================================
+# 3. EVENT-TYPE-SPECIFIC ARC / BLOCK BUILDERS
+#    Each takes one row of the "events" table (already collapsed
+#    to c1:c4) plus which PSI column/condition to use, and returns
+#    the junction(s) that should be drawn as arcs for that event.
+# ============================================================
+
+#' SE (skipped exon): two inclusion junctions sharing the same
+#' PSI/thickness, plus a reconstructed exclusion junction (c1->c4)
+#' weighted 1 - PSI. No retention block for SE.
+build_se_arcs_for_condition <- function(ev, psi_col, cond_label) {
+  bind_rows(
+    ev %>% transmute(event_id, gene_id, c1, c2, c3, c4,
+                     junc_start = c1, junc_end = c2,
+                     weight = .data[[psi_col]], arc_type = "inclusion",
+                     condition = cond_label),
+    ev %>% transmute(event_id, gene_id, c1, c2, c3, c4,
+                     junc_start = c3, junc_end = c4,
+                     weight = .data[[psi_col]], arc_type = "inclusion",
+                     condition = cond_label),
+    ev %>% transmute(event_id, gene_id, c1, c2, c3, c4,
+                     junc_start = c1, junc_end = c4,
+                     weight = 1 - .data[[psi_col]], arc_type = "exclusion",
+                     condition = cond_label)
+  )
+}
+
+#' RI (retained intron): the intron itself is c2->c3 (upstream exon
+#' ends at c2, downstream exon starts at c3). There is exactly ONE
+#' real junction -- splicing the intron out -- weighted by the
+#' spliced fraction (1 - PSI, since SUPPA2's RI PSI = retention
+#' level). The retained fraction (PSI) is returned separately as a
+#' "block" to be shaded directly on the gene line, not drawn as an arc.
+build_ri_arcs_and_blocks_for_condition <- function(ev, psi_col, cond_label) {
+  arcs <- ev %>% transmute(event_id, gene_id, c1, c2, c3, c4,
+                           junc_start = c2, junc_end = c3,
+                           weight = 1 - .data[[psi_col]],
+                           arc_type = "spliced_junction",
+                           condition = cond_label)
+  blocks <- ev %>% transmute(event_id, gene_id,
+                             xstart = c2, xend = c3,
+                             retention_level = .data[[psi_col]],
+                             condition = cond_label)
+  list(arcs = arcs, blocks = blocks)
+}
+
+
+#' MX (mutually exclusive exons): exon A's two junctions share PSI,
+#' exon B's two junctions share (1 - PSI). No exclusion arc -- there's
+#' always exactly one exon included, just which one varies.
+build_mx_arcs_for_condition <- function(ev, psi_col, cond_label) {
+  bind_rows(
+    ev %>% transmute(event_id, gene_id, junc_start = c1, junc_end = c2,
+                     weight = .data[[psi_col]], arc_type = "exonA", condition = cond_label),
+    ev %>% transmute(event_id, gene_id, junc_start = c3, junc_end = c6,
+                     weight = .data[[psi_col]], arc_type = "exonA", condition = cond_label),
+    ev %>% transmute(event_id, gene_id, junc_start = c1, junc_end = c4,
+                     weight = 1 - .data[[psi_col]], arc_type = "exonB", condition = cond_label),
+    ev %>% transmute(event_id, gene_id, junc_start = c5, junc_end = c6,
+                     weight = 1 - .data[[psi_col]], arc_type = "exonB", condition = cond_label)
+  )
+}
+#' Dispatcher: given one event's row and event_type, route to the
+#' correct builder above. Returns a list(arcs = ..., blocks = ...)
+#' for every event type -- blocks is NULL for event types that
+#' don't use one (e.g. SE).
+build_event_arcs_and_blocks <- function(ev, psi_col, cond_label) {
+  event_type <- unique(ev$event_type)
+  if (event_type == "SE") {
+    list(arcs = build_se_arcs_for_condition(ev, psi_col, cond_label),
+         blocks = NULL)
+  } else if (event_type == "RI") {
+    build_ri_arcs_and_blocks_for_condition(ev, psi_col, cond_label)
+  }else if (event_type == "MX") {                                    # NEW
+    list(arcs = build_mx_arcs_for_condition(ev, psi_col, cond_label),
+         blocks = NULL)
+  } else if (event_type == "AF") {
+    
+    list( arcs = build_af_arcs_for_condition(ev, psi_col,cond_label),blocks = NULL)
+    
+  } else if (event_type == "AL") {
+    list(arcs = build_al_arcs_for_condition(ev, psi_col, cond_label), blocks = NULL)
+  }else if (event_type == "A3") {
+    list(arcs = build_a3_arcs_for_condition(ev, psi_col, cond_label), blocks = NULL)
+  }else if (event_type == "A5") {
+    list(arcs = build_a5_arcs_for_condition(ev, psi_col, cond_label), blocks = NULL)
+  }else {
+    stop("Invalid Event")
+  }
+}
+
+#build af arcs for conditions
+#' Returns the genomic (start,end) pair for exon A, exon B, and the
+#' single shared-junction coordinate, correctly oriented for strand.
+
+
+build_af_arcs_for_condition <- function(ev, psi_col, cond_label) {
+  strand <- unique(ev$strand)
+  layout <- get_af_layout(ev$c1, ev$c2, ev$c3, ev$c4, ev$c5, strand)
+  
+  # On + strand the exon's splice-donor end is its genomic END (index 2).
+  # On - strand transcription runs the other way, so the splice-donor
+  # end is the exon's genomic START (index 1).
+  donor_idx <- if (strand == "-") 1 else 2
+  
+  bind_rows(
+    ev %>% transmute(
+      event_id, gene_id,
+      junc_start = layout$exonA[donor_idx], junc_end = layout$shared,
+      weight     = .data[[psi_col]],
+      arc_type   = "first_exon_A",
+      condition  = cond_label
+    ),
+    ev %>% transmute(
+      event_id, gene_id,
+      junc_start = layout$exonB[donor_idx], junc_end = layout$shared,
+      weight     = 1 - .data[[psi_col]],
+      arc_type   = "first_exon_B",
+      condition  = cond_label
+    )
+  )
+}
+# ============================================================
+# 4. ARC GEOMETRY (shared by SE and RI)
+# ============================================================
+
+#' Quadratic-bezier arc between two x positions, peaking at `height`.
+make_arc <- function(x_start, x_end, height, n = 60) {
+  t     <- seq(0, 1, length.out = n)
+  x_mid <- (x_start + x_end) / 2
+  x <- (1 - t)^2 * x_start + 2 * (1 - t) * t * x_mid + t^2 * x_end
+  y <- 2 * (1 - t) * t * height
+  data.frame(x = x, y = y)
+}
+
+#' Turn a long-format junction table (junc_start, junc_end, weight,
+#' arc_type, condition) into per-point arc coordinates for geom_path.
+#' Exclusion (SE) / spliced (RI) junctions are drawn taller so they
+#' visually sit above the inclusion arcs beneath them.
+
+build_arc_df <- function(junc_dt) {
+  arcs <- vector("list", nrow(junc_dt))
+  for (i in seq_len(nrow(junc_dt))) {
+    row <- junc_dt[i, ]
+    height <- dplyr::case_when(
+      row$arc_type %in% c("exclusion", "spliced_junction") ~ 1.4,
+      row$arc_type %in% c("exonB", "first_exon_B", "last_exon_B") ~ 1.0,
+      row$arc_type == "proximal_acceptor" ~ 1.0,     # A3: arcs UP
+      row$arc_type == "distal_acceptor"   ~ -1.0,    # A3: arcs DOWN
+      row$arc_type == "distal_acceptor" ~ 1.0,     # A5: arcs UP
+      row$arc_type == "distal_donor"   ~ -1.0,    # A5: arcs DOWN
+      #row$arc_type %in% c("distal_acceptor", "distal_donor")     ~ -0.8,
+      TRUE ~ 0.6
+    )
+    arc <- make_arc(row$junc_start, row$junc_end, height)
+    arc$junc_id   <- paste0(row$junc_start, "-", row$junc_end)
+    arc$weight    <- row$weight
+    arc$arc_type  <- row$arc_type
+    arc$condition <- row$condition
+    arcs[[i]] <- arc
+  }
+  bind_rows(arcs)
+}
+
+# ============================================================
+# 5. GTF HELPERS
+# ============================================================
+#' SUPPA2 concatenates multiple overlapping gene IDs with "_and_" when
+#' an event's coordinates fall within more than one annotated gene.
+#' For GTF lookups, just use the first listed gene.
+get_primary_gene_id <- function(gene_id_val) {
+  str_split(gene_id_val, "_and_")[[1]][1]
+}
+#' All unique (union) exon boundaries across every transcript of a
+#' gene -- used only to build the genomic->display axis, not for
+#' the transcript track itself (see get_transcripts_flanking_event).
+get_gene_exons <- function(gtf, gene_id_val) {
+  ex <- gtf[gtf$type == "exon" & gtf$gene_id == gene_id_val]
+  
+  ex_df <- as.data.frame(ex) %>%
+    dplyr::select(seqnames, start, end, strand) %>%
+    dplyr::distinct() %>%
+    dplyr::arrange(start)
+  ir <- IRanges::reduce(IRanges::IRanges(ex_df$start, ex_df$end))
+  data.frame(start = BiocGenerics::start(ir), end = BiocGenerics::end(ir))
+}
+
+#' Build a genomic-position -> compressed-display-position lookup
+#' function. Exons get a small fixed display width (exon_scale),
+#' introns get a larger fixed display width (intron_display_width)
+#' regardless of true length -- this is what keeps a 150 bp exon
+#' visible next to a 13,000 bp intron.
+build_gene_axis <- function(exon_df, intron_display_width = 4, exon_scale = 0.02,exon_display_max = 6) {
+  exon_df <- exon_df %>% dplyr::arrange(start)
+  segments <- list()
+  cursor <- 0
+  for (i in seq_len(nrow(exon_df))) {
+    ex_len <- exon_df$end[i] - exon_df$start[i]
+    ex_disp_len <- min(max(ex_len * exon_scale, 0.5), exon_display_max) 
+    segments[[length(segments) + 1]] <- data.frame(
+      g_start = exon_df$start[i], g_end = exon_df$end[i],
+      d_start = cursor, d_end = cursor + ex_disp_len, type = "exon"
+    )
+    cursor <- cursor + ex_disp_len
+    if (i < nrow(exon_df)) {
+      segments[[length(segments) + 1]] <- data.frame(
+        g_start = exon_df$end[i], g_end = exon_df$start[i + 1],
+        d_start = cursor, d_end = cursor + intron_display_width, type = "intron"
+      )
+      cursor <- cursor + intron_display_width
+    }
+  }
+  axis_map <- bind_rows(segments)
+  #print(axis_map)
+  Vectorize(function(g_pos) {
+    seg <- axis_map[g_pos >= pmin(axis_map$g_start, axis_map$g_end) &
+                      g_pos <= pmax(axis_map$g_start, axis_map$g_end), ][1, ]
+    if (nrow(seg) == 0) return(NA_real_)
+    frac <- (g_pos - seg$g_start) / (seg$g_end - seg$g_start)
+    seg$d_start + frac * (seg$d_end - seg$d_start)
+  })
+}
+
+#' Transcripts genuinely involved in this event: for SE, transcripts
+#' whose exon ends exactly at c1 AND whose exon starts exactly at c4
+#' -- i.e. the flanking exons that define the alternative region.
+#' (For RI you'd instead check exon boundaries at c2/c3 -- the intron
+#' itself -- if you need an RI-specific transcript filter.)
+get_transcripts_for_se_event <- function(gtf, gene_id_val, c1, c4,total_transcripts) {
+  
+  # split the comma-separated transcript list from the .ioe file into a vector
+  event_transcripts <- str_split(total_transcripts, ",")[[1]] %>% trimws()
+  
+  all_ex <- gtf[gtf$type == "exon" & gtf$gene_id == gene_id_val & gtf$transcript_id %in% event_transcripts] %>%
+    as.data.frame() %>%
+    dplyr::select(transcript_id, seqnames, start, end, strand) %>%
+    dplyr::distinct() %>%
+    dplyr::arrange(transcript_id, start)
+}
+
+#' Tag which exon (in the transcript track) corresponds to which
+#' role in an SE event, so it can be highlighted in a different color.
+mark_affected_exons_se <- function(tx_exons, c1, c2, c3, c4) {
+  tx_exons %>%
+    mutate(affected = case_when(
+      start == c2 & end == c3 ~ "skipped_exon",
+      end   == c1              ~ "upstream_flank",
+      start == c4              ~ "downstream_flank",
+      TRUE                     ~ "other"
+    ))
+}
+
+#RI
+#' Transcripts genuinely spanning this RI event: retained-form
+#' transcripts have ONE exon covering the full c2->c3 span (no
+#' junction there); spliced-form transcripts have separate exons
+#' ending at c2 and starting at c3. This pulls transcripts matching
+#' EITHER pattern so both isoforms show up in the track.
+get_transcripts_for_ri_event <- function(gtf, gene_id_val, c2, c3,total_transcripts) {
+  
+  # split the comma-separated transcript list from the .ioe file into a vector
+  event_transcripts <- str_split(total_transcripts, ",")[[1]] %>% trimws()
+  
+  all_ex <- gtf[gtf$type == "exon" & gtf$gene_id == gene_id_val & gtf$transcript_id %in% event_transcripts] %>%
+    as.data.frame() %>%
+    dplyr::select(transcript_id, seqnames, start, end, strand) %>%
+    dplyr::distinct() %>%
+    dplyr::arrange(transcript_id, start)
+}
+
+
+#' Tag exon roles for an RI event: the exon that spans straight
+#' through the intron (retained form) vs the flanking exons that
+#' stop/start right at the intron boundary (spliced form).
+mark_affected_exons_ri <- function(tx_exons, c2, c3) {
+  tx_exons %>%
+    mutate(affected = case_when(
+      start <= c2 & end >= c3 ~ "retained_intron_exon",
+      end   == c2              ~ "upstream_flank",
+      start == c3              ~ "downstream_flank",
+      TRUE                     ~ "other"
+    ))
+}
+
+#MX event
+
+get_transcripts_for_mx_event <- function(gtf, gene_id_val, c1, c2, c3, c4, c5, c6,total_transcripts) {
+  # split the comma-separated transcript list from the .ioe file into a vector
+  event_transcripts <- str_split(total_transcripts, ",")[[1]] %>% trimws()
+  all_ex <- gtf[gtf$type == "exon" & gtf$gene_id == gene_id_val & gtf$transcript_id %in% event_transcripts] %>%
+    as.data.frame() %>%
+    dplyr::select(transcript_id, seqnames, start, end, strand) %>%
+    dplyr::distinct() %>%
+    dplyr::arrange(transcript_id, start)
+}
+
+mark_affected_exons_mx <- function(tx_exons, c2, c3, c4, c5) {
+  tx_exons %>%
+    mutate(affected = case_when(
+      start == c2 & end == c3 ~ "exonA",
+      start == c4 & end == c5 ~ "exonB",
+      TRUE                    ~ "other"
+    ))
+}
+
+#AF event
+#' Returns the genomic (start,end) pair for exon A, exon B, and the
+#' single shared-junction coordinate, correctly oriented for strand.
+get_af_layout <- function(c1, c2, c3, c4, c5, strand) {
+  if (strand == "-") {
+    list(exonA = c(c4, c5), exonB = c(c2, c3), shared = c1)
+  } else {
+    list(exonA = c(c1, c2), exonB = c(c3, c4), shared = c5)
+  }
+}
+get_transcripts_for_af_event <- function(gtf, gene_id_val, c1, c2, c3, c4, c5, strand,total_transcripts) {
+  layout <- get_af_layout(c1, c2, c3, c4, c5, strand)
+  # split the comma-separated transcript list from the .ioe file into a vector
+  event_transcripts <- str_split(total_transcripts, ",")[[1]] %>% trimws()
+  
+  all_ex <- gtf[gtf$type == "exon" & gtf$gene_id == gene_id_val & gtf$transcript_id %in% event_transcripts] %>%
+    as.data.frame() %>%
+    dplyr::select(transcript_id, seqnames, start, end, strand) %>%
+    dplyr::distinct() %>%
+    dplyr::arrange(transcript_id, start)
+  
+  # tx <- all_ex %>%
+  #   dplyr::filter(
+  #     (start == layout$exonA[1] & end == layout$exonA[2]) |
+  #       (start == layout$exonB[1] & end == layout$exonB[2])
+  #   ) %>%
+  #   dplyr::pull(transcript_id) %>%
+  #   unique()
+  
+}
+
+#' Tag which exon (in the transcript track) corresponds to which AF
+#' so it can be highlighted in a different color.
+mark_affected_exons_af <- function(tx_exons, c1, c2, c3, c4, c5, strand) {
+  layout <- get_af_layout(c1, c2, c3, c4, c5, strand)
+  tx_exons %>%
+    mutate(affected = case_when(
+      start == layout$exonA[1] & end == layout$exonA[2] ~ "first_exon_A",
+      start == layout$exonB[1] & end == layout$exonB[2] ~ "first_exon_B",
+      start == layout$shared | end == layout$shared      ~ "shared_downstream",
+      TRUE                                                ~ "other"
+    ))
+}
+
+
+#AL event
+#' AL is AF mirrored: a SHARED exon splices into two alternative LAST
+#' exons, instead of two alternative first exons sharing one downstream
+#' exon. Shared sits at the low end on + strand, high end on - strand.
+get_al_layout <- function(c1, c2, c3, c4, c5, strand) {
+  if (strand == "-") {
+    list(exonA = c(c1, c2), exonB = c(c3, c4), shared = c5)
+  } else {
+    list(exonA = c(c2, c3), exonB = c(c4, c5), shared = c1)
+  }
+}
+
+get_al_junction_pairs <- function(c1, c2, c3, c4, c5, strand) {
+  if (strand == "-") {
+    list(exonA_junc = c(c5, c2), exonB_junc = c(c5, c4))
+  } else {
+    list(exonA_junc = c(c1, c2), exonB_junc = c(c1, c4))
+  }
+}
+
+#arc builder
+
+build_al_arcs_for_condition <- function(ev, psi_col, cond_label) {
+  strand <- unique(ev$strand)
+  jp <- get_al_junction_pairs(ev$c1, ev$c2, ev$c3, ev$c4, ev$c5, strand)
+  
+  bind_rows(
+    ev %>% transmute(event_id, gene_id,
+                     junc_start = jp$exonA_junc[1], junc_end = jp$exonA_junc[2],
+                     weight = .data[[psi_col]], arc_type = "last_exon_A", condition = cond_label),
+    ev %>% transmute(event_id, gene_id,
+                     junc_start = jp$exonB_junc[1], junc_end = jp$exonB_junc[2],
+                     weight = 1 - .data[[psi_col]], arc_type = "last_exon_B", condition = cond_label)
+  )
+}
+
+#Transcript fetch + exon tagging: AL
+get_transcripts_for_al_event <- function(gtf, gene_id_val, c1, c2, c3, c4, c5, strand,total_transcripts) {
+  layout <- get_al_layout(c1, c2, c3, c4, c5, strand)
+  # split the comma-separated transcript list from the .ioe file into a vector
+  event_transcripts <- str_split(total_transcripts, ",")[[1]] %>% trimws()
+  print(total_transcripts)
+  all_ex <- gtf[gtf$type == "exon" & gtf$gene_id == gene_id_val & gtf$transcript_id %in% event_transcripts] %>%
+    as.data.frame() %>%
+    dplyr::select(transcript_id, seqnames, start, end, strand) %>%
+    dplyr::distinct() %>%
+    dplyr::arrange(transcript_id, start)
+
+}
+
+mark_affected_exons_al <- function(tx_exons, c1, c2, c3, c4, c5, strand) {
+  layout <- get_al_layout(c1, c2, c3, c4, c5, strand)
+  tx_exons %>%
+    mutate(affected = case_when(
+      start == layout$exonA[1] & end == layout$exonA[2] ~ "last_exon_A",
+      start == layout$exonB[1] & end == layout$exonB[2] ~ "last_exon_B",
+      start == layout$shared | end == layout$shared      ~ "shared_upstream",
+      TRUE                                                ~ "other"
+    ))
+}
+
+#A3
+
+#' A3SS: one shared splice donor + two alternative acceptor sites.
+#' Shared sits at the low end on + strand, high end on - strand
+#' (same convention as AL). "near"/"far" = distance from the shared site.
+get_a3_layout <- function(c1, c2, c3, strand) {
+  if (strand == "-") {
+    list(shared = c3, alt_near = c2, alt_far = c1)
+  } else {
+    list(shared = c1, alt_near = c2, alt_far = c3)
+  }
+}
+
+build_a3_arcs_for_condition <- function(ev, psi_col, cond_label) {
+  strand <- unique(ev$strand)
+  layout <- get_a3_layout(ev$c1, ev$c2, ev$c3, strand)
+  
+  bind_rows(
+    ev %>% transmute(event_id, gene_id,
+                     junc_start = layout$shared, junc_end = layout$alt_near,
+                     weight = .data[[psi_col]], arc_type = "proximal_acceptor",
+                     condition = cond_label),
+    ev %>% transmute(event_id, gene_id,
+                     junc_start = layout$shared, junc_end = layout$alt_far,
+                     weight = 1 - .data[[psi_col]], arc_type = "distal_acceptor",
+                     condition = cond_label)
+  )
+}
+
+
+get_transcripts_for_a3_event <- function(gtf, gene_id_val, c1, c2, c3, strand,total_transcripts) {
+  # split the comma-separated transcript list from the .ioe file into a vector
+  event_transcripts <- str_split(total_transcripts, ",")[[1]] %>% trimws()   # trimws() guards against stray whitespace
+  
+  
+  layout <- get_a3_layout(c1, c2, c3, strand)
+  all_ex <- gtf[gtf$type == "exon" & gtf$gene_id == gene_id_val & gtf$transcript_id %in% event_transcripts] %>%
+    as.data.frame() %>%
+    dplyr::select(transcript_id, seqnames, start, end, strand) %>%
+    dplyr::distinct() %>%
+    dplyr::arrange(transcript_id, start)
+  
+  # a transcript uses this A3 event if one of its exons has the shared
+  # boundary paired with EITHER alternative acceptor
+  #print(all_ex)
+   #tx <- all_ex %>%
+  #   dplyr::filter(
+   #    (start == min(layout$shared, layout$alt_near) & end == max(layout$shared, layout$alt_near)) |
+  #       (start == min(layout$shared, layout$alt_far)  & end == max(layout$shared, layout$alt_far))
+   #  ) %>% dplyr::distinct()
+   
+  #tx <- all_ex %>%
+    #dplyr::filter(
+     # ((start == layout$alt_near) | (start == layout$alt_far)) | (end == layout$shared)
+    #) %>%
+    #dplyr::distinct()
+
+   
+}
+
+mark_affected_exons_a3 <- function(tx_exons, c1, c2, c3, strand) {
+  layout <- get_a3_layout(c1, c2, c3, strand)
+  tx_exons %>%mutate(affected = case_when(
+    start == layout$alt_near | end == layout$alt_near ~ "proximal_exon",
+    start == layout$alt_far  | end == layout$alt_far  ~ "distal_exon",
+    start == layout$shared   | end == layout$shared   ~ "shared",
+    TRUE ~ "other"
+  ))
+}
+
+#' A5SS: two alternative 5' donor sites splice into one SHARED
+#' downstream acceptor exon. Mirror of A3 -- shared sits at the
+#' HIGH end on + strand (opposite of A3, where shared sits low).
+get_a5_layout <- function(c1, c2, c3, strand) {
+  if (strand == "-") {
+    list(shared = c1, alt_near = c2, alt_far = c3)
+  } else {
+    list(shared = c3, alt_near = c2, alt_far = c1)
+  }
+}
+
+build_a5_arcs_for_condition <- function(ev, psi_col, cond_label) {
+  strand <- unique(ev$strand)
+  layout <- get_a5_layout(ev$c1, ev$c2, ev$c3, strand)
+  
+  bind_rows(
+    ev %>% transmute(event_id, gene_id,
+                     junc_start = layout$alt_near, junc_end = layout$shared,
+                     weight = .data[[psi_col]], arc_type = "proximal_donor",
+                     condition = cond_label),
+    ev %>% transmute(event_id, gene_id,
+                     junc_start = layout$alt_far, junc_end = layout$shared,
+                     weight = 1 - .data[[psi_col]], arc_type = "distal_donor",
+                     condition = cond_label)
+  )
+}
+
+get_transcripts_for_a5_event <- function(gtf, gene_id_val, c1, c2, c3, strand, total_transcripts) {
+  event_transcripts <- str_split(total_transcripts, ",")[[1]] %>% trimws()
+  
+  all_ex <- gtf[gtf$type == "exon" & gtf$gene_id == gene_id_val & gtf$transcript_id %in% event_transcripts] %>%
+    as.data.frame() %>%
+    dplyr::select(transcript_id, seqnames, start, end, strand) %>%
+    dplyr::distinct() %>%
+    dplyr::arrange(transcript_id, start)
+  
+  all_ex
+}
+
+mark_affected_exons_a5 <- function(tx_exons, c1, c2, c3, strand) {
+  layout <- get_a5_layout(c1, c2, c3, strand)
+  tx_exons %>%
+    mutate(affected = case_when(
+      start == layout$alt_near | end == layout$alt_near ~ "proximal_exon",
+      start == layout$alt_far  | end == layout$alt_far  ~ "distal_exon",
+      start == layout$shared   | end == layout$shared    ~ "shared",
+      TRUE ~ "other"
+    ))
+}
+
+
+
+
+# ============================================================
+# 6. PLOTTING
+# ============================================================
+
+#' Draw one condition's arc panel. `blocks` is optional (NULL for
+#' SE, a retention-level table for RI) -- when present it's drawn
+#' as a shaded rect on the gene line under the arcs.
+plot_condition_panel <- function(cond_label, arcs, exons, blocks, xlim, c1, c4, pad) {
+  arc_c     <- arcs %>% dplyr::filter(condition == cond_label)
+  
+  label_pts <- arc_c %>%
+    dplyr::mutate(is_downward = arc_type %in% c("distal_acceptor","distal_donor")) %>%
+    dplyr::group_by(junc_id, arc_type) %>%
+    dplyr::group_modify(~ {
+      if (unique(.x$is_downward)) {
+        dplyr::slice_min(.x, y, n = 1, with_ties = FALSE)
+      } else {
+        dplyr::slice_max(.x, y, n = 1, with_ties = FALSE)
+      }
+    }) %>%
+    dplyr::ungroup() %>%
+    dplyr::mutate(label_y = ifelse(is_downward, y - 0.25, y + 0.25))
+   # dplyr::mutate(label_y = y + sign(y) * 0.15)
+  
+  #print(arc_c %>% dplyr::filter(condition == "gfp") %>% dplyr::group_by(arc_type) %>%
+          #dplyr::summarise(min_x = min(x), max_x = max(x), min_y = min(y), max_y = max(y)))
+  
+  
+  p <- ggplot() +
+    geom_segment(aes(x = c1 - pad, xend = c4 + pad, y = 0, yend = 0),
+                 color = "black", linewidth = 0.4) +
+    geom_rect(data = exons, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
+              fill = "black")
+  
+  if (!is.null(blocks)) {
+    block_c <- blocks %>% dplyr::filter(condition == cond_label)
+    p <- p + geom_rect(data = block_c,
+                       aes(xmin = xstart, xmax = xend, ymin = -0.06, ymax = 0.06,
+                           alpha = retention_level),
+                       fill = "steelblue")+
+      geom_label(data = block_c,                                    # NEW
+                aes(x = (xstart + xend) / 2, y = -0.15,             # sits just below the block
+                    label = sprintf("%.2f", retention_level)),
+                size = 3.2, color = "blue",                                    # CHANGED: was steelblue4
+                fill = "white",
+                label.size = 0,
+                label.padding = unit(0.12, "lines"))
+  }
+
+  
+  p +
+    geom_path(data = arc_c,
+              aes(x = x, y = y, group = junc_id, linewidth = weight, alpha = weight),
+              color = "firebrick") +
+    geom_label(data = label_pts,
+               aes(x = x, y = label_y, label = sprintf("%.2f", weight)),
+               size = 3.2,
+               color = "blue",             # NEW: label text color, contrasts with the red arc
+               fill = "white",              # NEW: opaque background so the arc never shows through
+               label.size = 0,              # removes the label's border outline
+               label.padding = unit(0.12, "lines"))+   # keeps the background pill small/tight
+    #geom_text(data = label_pts,
+    #          aes(x = x, y = y + 0.1, label = sprintf("%.2f", weight)),
+    #          size = 3.2, color = "firebrick") +
+    scale_linewidth(range = c(0.4, 4), limits = c(0, 1), guide = "none") +
+    scale_alpha(range = c(0.45, 1), limits = c(0, 1), guide = "none") +
+    coord_cartesian(xlim = xlim, ylim = c(-1.6,1.6)) +
+    labs(y = cond_label) +
+    theme_void() +
+    theme(axis.title.y = element_text(angle = 90, size = 11, face = "bold"),
+          plot.margin = margin(8, 12, 8, 12))
+}
+
+#' Transcript track: one row per transcript, exons as boxes
+#' (affected ones highlighted), genomic coordinate ticks along
+#' the x-axis, all in the same display-space x as the arc panels.
+plot_transcript_track <- function(tx_exons, xlim) {
+  tx_ids <- sort(unique(tx_exons$transcript_id))
+  y_map  <- setNames(seq_along(tx_ids), tx_ids)
+  tx_exons <- tx_exons %>% mutate(y = y_map[transcript_id])
+
+  
+  introns <- tx_exons %>%
+    group_by(transcript_id, y) %>%
+    summarise(xstart = min(xmin), xend = max(xmax), .groups = "drop")
+  #print(introns)
+  # genomic <-> display coordinate ticks, taken straight from each
+  # exon boundary already mapped through g2d()
+   tick_df <- bind_rows(
+     tx_exons %>% dplyr::select(genomic = start, display = xmin),
+     tx_exons %>% dplyr::select(genomic = end,   display = xmax)
+   ) %>%
+     dplyr::distinct() %>%
+     dplyr::arrange(display)
+   
+   ggplot() +
+     geom_segment(data = introns, aes(x = xstart, xend = xend, y = y, yend = y),
+                  color = "black", linewidth = 0.3) +
+     geom_rect(data = tx_exons,
+               aes(xmin = xmin, xmax = xmax, ymin = y - 0.32, ymax = y + 0.32,
+                   fill = affected != "other"),
+               color = NA) +
+     scale_fill_manual(values = c(`TRUE` = "firebrick", `FALSE` = "grey35"), guide = "none") +
+     scale_y_continuous(breaks = y_map, labels = names(y_map)) +
+     scale_x_continuous(breaks = tick_df$display,
+                        labels = format(tick_df$genomic, big.mark = ",", scientific = FALSE)) +
+     coord_cartesian(xlim = xlim) +
+     theme_classic(base_size = 8) +
+     theme(axis.title = element_blank(), panel.grid = element_blank(),
+           axis.text.x = element_text(angle = 45, hjust = 1, size = 6),
+           axis.ticks.x = element_line())
+}
+
+#' Full per-event figure: two condition arc panels + one transcript
+#' track, all sharing the same GTF-derived display-space x-axis.
+#' Dispatches SE vs RI internally via build_event_arcs_and_blocks().
+plot_event <- function(event_id_val, events, gtf, cond1_name, cond2_name) {
+  ev_row <- events %>% dplyr::filter(event_id == event_id_val)
+  event_type <- ev_row$event_type
+  #print(ev_row$gene_id)
+  gene_id_for_gtf <- get_primary_gene_id(ev_row$gene_id)
+  # NEW: significance stars from the single event-level p-value
+  sig_stars <- dplyr::case_when(
+    ev_row$pvalue < 0.001 ~ "***",
+    ev_row$pvalue < 0.01  ~ "**",
+    ev_row$pvalue < 0.05  ~ "*",
+    TRUE                  ~ ""
+  )
+  
+  # --- STEP 1: fetch event-flanking transcripts + tag affected exons
+  #     (SE vs RI specific fetch/tag logic, same for both from here on) ---
+  if (event_type == "SE") {
+    tx_exons_raw <- get_transcripts_for_se_event(gtf, ev_row$gene_id, ev_row$c1, ev_row$c4,ev_row$total_transcripts)
+    tx_exons     <- mark_affected_exons_se(tx_exons_raw, ev_row$c1, ev_row$c2, ev_row$c3, ev_row$c4)
+  } else if (event_type == "RI") {
+    tx_exons_raw <- get_transcripts_for_ri_event(gtf, ev_row$gene_id, ev_row$c2, ev_row$c3,ev_row$total_transcripts)
+    tx_exons     <- mark_affected_exons_ri(tx_exons_raw, ev_row$c2, ev_row$c3)
+  }else if (event_type == "MX") {   
+    tx_exons_raw <- get_transcripts_for_mx_event(gtf, ev_row$gene_id,ev_row$c1, ev_row$c2, ev_row$c3,ev_row$c4, ev_row$c5, ev_row$c6,ev_row$total_transcripts)
+    tx_exons     <- mark_affected_exons_mx(tx_exons_raw, ev_row$c2, ev_row$c3, ev_row$c4, ev_row$c5)
+  } else if (event_type == "AF") {
+    
+    tx_exons_raw <- get_transcripts_for_af_event(gtf, ev_row$gene_id,ev_row$c1, ev_row$c2, ev_row$c3,ev_row$c4, ev_row$c5, ev_row$strand,ev_row$total_transcripts)
+    tx_exons <- mark_affected_exons_af(tx_exons_raw,ev_row$c1, ev_row$c2, ev_row$c3,ev_row$c4, ev_row$c5, ev_row$strand)
+    #print(tx_exons)
+    
+  }else if (event_type == "AL") {
+    tx_exons_raw <- get_transcripts_for_al_event(gtf, ev_row$gene_id,ev_row$c1, ev_row$c2, ev_row$c3,ev_row$c4, ev_row$c5, ev_row$strand,ev_row$total_transcripts)
+    tx_exons <- mark_affected_exons_al(tx_exons_raw,ev_row$c1, ev_row$c2, ev_row$c3,ev_row$c4, ev_row$c5, ev_row$strand)
+  }else if (event_type == "A3") {
+    gene_id_for_gtf <- get_primary_gene_id(ev_row$gene_id)
+    #print("-----")
+    tx_exons_raw <- get_transcripts_for_a3_event(gtf, gene_id_for_gtf, ev_row$c1, ev_row$c2, ev_row$c3, ev_row$strand,ev_row$total_transcripts)
+    
+    tx_exons     <- mark_affected_exons_a3(tx_exons_raw, ev_row$c1, ev_row$c2, ev_row$c3, ev_row$strand)
+    #print(tx_exons)
+    
+    
+  }else if (event_type == "A5") {
+    gene_id_for_gtf <- get_primary_gene_id(ev_row$gene_id)
+    tx_exons_raw <- get_transcripts_for_a5_event(gtf, gene_id_for_gtf, ev_row$c1, ev_row$c2, ev_row$c3,
+                                                 ev_row$strand, ev_row$total_transcripts)
+    tx_exons     <- mark_affected_exons_a5(tx_exons_raw, ev_row$c1, ev_row$c2, ev_row$c3, ev_row$strand)
+  }else {
+    stop("Invalid Event")
+  }
+  
+  # prevents unrelated exons elsewhere in the matched transcripts (e.g.
+  # further downstream/upstream of an AF/AL event) from sneaking into
+  # the visible window and rendering as an unexpected extra exon box.
+  event_coords <- c(ev_row$c1, ev_row$c2, ev_row$c3, ev_row$c4, ev_row$c5, ev_row$c6)
+  event_bounds <- range(event_coords, na.rm = TRUE)
+  tx_exons_raw <- tx_exons_raw %>%dplyr::filter(end >= event_bounds[1], start <= event_bounds[2])
+  #print(tx_exons_raw)
+  
+  
+  # --- STEP 2: collapse to a clean, non-overlapping exon union and
+  #     build the ONE genomic->display axis -- SAME reduce() logic
+  #     regardless of event type ---
+   tx_union_exons <- tx_exons_raw %>%
+     dplyr::select(start, end) %>%
+     dplyr::distinct() %>%
+     dplyr::arrange(start)
+   
+   ir <- IRanges::reduce(IRanges::IRanges(tx_union_exons$start, tx_union_exons$end))
+   tx_union_exons <- data.frame(start = BiocGenerics::start(ir), end = BiocGenerics::end(ir))
+   #print(tx_union_exons)
+   
+   g2d <- build_gene_axis(tx_union_exons)   # built exactly once, works for either event type
+   
+  # --- STEP 3: NOW g2d exists, so map event coordinates ---
+   c1 <- g2d(ev_row$c1); c2 <- g2d(ev_row$c2)
+   c3 <- g2d(ev_row$c3); c4 <- g2d(ev_row$c4)
+   
+   c_right <- if (event_type == "MX") {
+     g2d(ev_row$c6)
+   } else if (event_type %in% c("AF", "AL")) {
+     g2d(ev_row$c5)
+   } else if (event_type %in% c("A3", "A5")) {
+     c3
+   } else {
+     c4
+   }
+   
+   # --- STEP 4: arcs / blocks, via the SE/RI dispatcher, mapped through g2d ---
+   r1 <- build_event_arcs_and_blocks(ev_row, "psi_cond1", cond1_name)
+   r2 <- build_event_arcs_and_blocks(ev_row, "psi_cond2", cond2_name)
+   #print(r1)
+   jt <- bind_rows(r1$arcs, r2$arcs) %>%
+    mutate(junc_start = g2d(junc_start), junc_end = g2d(junc_end))
+   #print(jt)
+   arcs <- build_arc_df(jt)
+   
+   blocks <- NULL
+   if (!is.null(r1$blocks)) {
+     blocks <- bind_rows(r1$blocks, r2$blocks) %>%
+       mutate(xstart = g2d(xstart), xend = g2d(xend))
+   }
+   
+  # --- STEP 5: gene exon boxes (from the union track) and per-transcript
+  #      exon boxes (un-collapsed), both mapped through the SAME g2d ---
+  exons <- tx_union_exons %>%
+     rowwise() %>%
+     mutate(xmin = g2d(start), xmax = g2d(end)) %>%
+     ungroup() %>%
+     transmute(xmin, xmax, ymin = -0.06, ymax = 0.06)
+  #print(exons)
+   tx_exons <- tx_exons %>%dplyr::filter(end >= event_bounds[1], start <= event_bounds[2]) %>%
+     rowwise() %>%
+     mutate(xmin = g2d(start), xmax = g2d(end)) %>%
+     ungroup()
+   
+   #print(tx_exons$transcript_id%>%unique())
+   
+   #
+  # # --- STEP 6: assemble the figure ---
+   pad <- (c_right - c1) * 0.08
+   xlim_shared <- c(c1 - pad, c_right + pad)
+   
+   p1 <- plot_condition_panel(cond1_name, arcs, exons, blocks, xlim_shared, c1, c_right, pad)
+   p2 <- plot_condition_panel(cond2_name, arcs, exons, blocks, xlim_shared, c1, c_right, pad)
+   tx_panel <- plot_transcript_track(tx_exons, xlim_shared)
+   
+   subtitle_text <- sprintf("%s\ndPSI = %.2f, p = %.3g%s",ev_row$event_id, ev_row$dPSI, ev_row$pvalue, sig_stars)
+   
+   title_text <- if (!is.na(ev_row$gene_name)) { 
+     sprintf("%s (%s)", ev_row$gene_name, ev_row$gene_id)
+   } else {
+     ev_row$gene_id
+   }
+   
+   n_tx <- length(unique(tx_exons$transcript_id))
+   (p1 / p2 / tx_panel) +
+     plot_layout(heights = c(1, 1, max(0.6, n_tx * 0.35))) +
+     plot_annotation(title = title_text, subtitle = subtitle_text,
+                     theme = theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+                                   plot.subtitle = element_text(hjust = 0.5, size = 10),
+                                   plot.margin = margin(5, 5, 15, 5)))
+}
+
+#p <- plot_event("ENSG00000105887.11;A3:chr7:135927061-135928075:135927059-135928075:-", events, gtf, cond1_name, cond2_name)
+  
+  
+
+# ============================================================
+# 7. MAIN SCRIPT -- edit these paths / names, then run
+# ============================================================
+
+# ============================================================
+# COMMAND LINE ARGUMENTS
+# ============================================================
+
+option_list <- list(
+  make_option(c("-i", "--ioe"),type = "character",help = "SUPPA2 IOE file"),
+  make_option(c("--psi1"),type = "character",help = "PSI matrix for condition 1"),
+  make_option(c("--psi2"),type = "character",help = "PSI matrix for condition 2"),
+  make_option(c("-d", "--dpsi"),type = "character",default = NA,help = "SUPPA2 dPSI file [optional]"),
+  make_option(c("-g", "--gtf"),type = "character",help = "Reference GTF"),
+  make_option(c("--cond1"),type = "character",default = "Condition1",help = "Condition 1 name"),
+  make_option(c("--cond2"),type = "character",default = "Condition2",help = "Condition 2 name"),
+  make_option(c("-t", "--target_event"),type = "character",default = NA,help = "Event ID to plot"),
+  make_option(c("-o", "--outdir"),type = "character",default = "event_plots",help = "Output directory")
+)
+
+parser <- OptionParser(option_list = option_list)
+
+opt <- parse_args(parser)
+
+required_args <- c(
+  "ioe",
+  "psi1",
+  "psi2",
+  "gtf"
+)
+
+missing_args <- required_args[
+  sapply(required_args, function(x) is.null(opt[[x]]))
+]
+
+if (length(missing_args) > 0) {
+  print_help(parser)
+  stop(
+    "\nMissing required arguments: ",
+    paste(missing_args, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+
+#ioe_file    <- "/Users/hiteshkore/Library/CloudStorage/OneDrive-TheUniversityofMelbourne/Hitesh_parker_lab/Collaborative_projects/RNPS_1/transcript_quantifications/Differential_expression/Bambu_results_HK_latest/splicing_analysis/SUPPA2_results/splicing_A3_strict.ioe"
+#psi_cond1   <- "/Users/hiteshkore/Library/CloudStorage/OneDrive-TheUniversityofMelbourne/Hitesh_parker_lab/Collaborative_projects/RNPS_1/transcript_quantifications/Differential_expression/Bambu_results_HK_latest/splicing_analysis/A3/psi_asp.psi"
+#psi_cond2   <- "/Users/hiteshkore/Library/CloudStorage/OneDrive-TheUniversityofMelbourne/Hitesh_parker_lab/Collaborative_projects/RNPS_1/transcript_quantifications/Differential_expression/Bambu_results_HK_latest/splicing_analysis/A3/psi_ala.psi"
+#dpsi_file   <- "/Users/hiteshkore/Library/CloudStorage/OneDrive-TheUniversityofMelbourne/Hitesh_parker_lab/Collaborative_projects/RNPS_1/transcript_quantifications/Differential_expression/Bambu_results_HK_latest/splicing_analysis//A3/deltapsi_alavsasp_A3.dpsi.txt"
+#cond1_name  <- "gfp"
+#cond2_name  <- "wt"
+#target_gene <- "ENSG00000105887.11"
+#gene_id_col <- "gene_id"
+#reference_gtf <- "/Users/hiteshkore/Library/CloudStorage/OneDrive-TheUniversityofMelbourne/Hitesh_parker_lab/Collaborative_projects/RNPS_1/transcript_quantifications/Differential_expression/Bambu_results_HK_latest/splicing_analysis/SUPPA2_results/extended_annotations.gtf"
+#outdir <- "event_plots"
+#splicing_type="A3" 
+
+ioe_file      <- opt$ioe
+psi_cond1     <- opt$psi1
+psi_cond2     <- opt$psi2
+dpsi_file     <- opt$dpsi
+cond1_name    <- opt$cond1
+cond2_name    <- opt$cond2
+target_event   <- opt$`target_event`
+reference_gtf <- opt$gtf
+outdir        <- opt$outdir
+
+get_event_type <- function(event_id) {
+  sub(":.*", "", sub(".*;", "", event_id))
+}
+
+splicing_type=get_event_type(target_event)
+
+print(splicing_type)
+
+dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+
+# --- load SUPPA2 outputs ---
+ioe <- fread(ioe_file)
+
+print(target_event)
+
+ioe_sub <- if (!is.na(target_event)) {
+  ioe[ioe[["event_id"]] %in% target_event, ]
+} else {
+  ioe
+}
+
+stopifnot(nrow(ioe_sub) > 0)
+#print("------")
+#print(ioe_sub)
+
+junctions <- build_raw_junction_table_from_ioe(ioe_sub)
+
+
+
+psi1 <- fread(psi_cond1); setnames(psi1, 1, "event_id")
+psi2 <- fread(psi_cond2); setnames(psi2, 1, "event_id")
+psi1_mean <- psi1[, .(event_id, psi_cond1 = rowMeans(.SD, na.rm = TRUE)), .SDcols = setdiff(names(psi1), "event_id")]
+psi2_mean <- psi2[, .(event_id, psi_cond2 = rowMeans(.SD, na.rm = TRUE)), .SDcols = setdiff(names(psi2), "event_id")]
+
+junctions <- junctions %>%
+  left_join(psi1_mean, by = "event_id") %>%
+  left_join(psi2_mean, by = "event_id") %>%
+  filter(!is.na(psi_cond1) | !is.na(psi_cond2))
+
+if (file.exists(dpsi_file)) {
+  dpsi <- fread(dpsi_file); setnames(dpsi, 1, "event_id")
+  dpsi_col  <- grep("dPSI", names(dpsi), value = TRUE)[1]
+  pval_col  <- grep("p-val", names(dpsi), value = TRUE, ignore.case = TRUE)[1]
+  junctions <- junctions %>%
+    left_join(dpsi %>% dplyr::select(event_id, dPSI = all_of(dpsi_col), pvalue = all_of(pval_col)), by = "event_id") 
+}
+
+# --- collapse to one row per event (c1:c4), works for SE and RI alike ---
+events <- collapse_to_event_coordinates(junctions)
+ioe_sub_transcripts<-ioe_sub%>%dplyr::select(event_id,total_transcripts)
+
+events<-left_join(events,ioe_sub_transcripts,by="event_id")
+
+
+# --- load GTF once, reuse for every event ---
+gtf <- import(reference_gtf)
+
+unique_genes <- data.frame(gene_id = unique(events$gene_id)) %>%
+  mutate(gene_name = sapply(gene_id, function(g) get_gene_name(gtf, get_primary_gene_id(g))))
+
+events <- events %>% left_join(unique_genes, by = "gene_id")%>%filter(event_type==splicing_type)
+
+print(events)
+
+# --- one figure per event, saved to disk ---
+for (eid in unique(events$event_id)) {
+  #print(eid)
+  p <- plot_event(eid, events, gtf, cond1_name, cond2_name)
+  p
+  safe_name <- str_replace_all(eid, "[:;]", "_")
+  #print(safe_name)
+  ggsave(file.path(outdir, paste0(safe_name, ".png")), p, width = 7, height = 5, dpi = 300)
+}
+message("Wrote ", length(unique(events$event_id)), " event plot(s) to '", outdir, "/'")

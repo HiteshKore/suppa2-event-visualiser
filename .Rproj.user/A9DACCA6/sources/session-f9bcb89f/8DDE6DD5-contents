@@ -1,0 +1,29 @@
+#for i in AF AL A5 A3 MX SE RI ; do
+#cat "$i/psi_asp.psi" >> psi_asp_combined.txt
+#done
+
+
+#for i in AF AL A5 A3 MX SE RI ; do
+#cat "$i/"deltapsi_wtvsgfp_*dpsi.txt >>combined_delta_psi.txt ; done
+
+IOE="/Users/hiteshkore/Library/CloudStorage/OneDrive-TheUniversityofMelbourne/Hitesh_parker_lab/Collaborative_projects/RNPS_1/transcript_quantifications/Differential_expression/Bambu_results_HK_latest/splicing_analysis/SUPPA2_results/splicing_all_strict.ioe"
+PSI1="/Users/hiteshkore/Library/CloudStorage/OneDrive-TheUniversityofMelbourne/Hitesh_parker_lab/Collaborative_projects/RNPS_1/transcript_quantifications/Differential_expression/Bambu_results_HK_latest/splicing_analysis/psi_gfp_combined.txt"
+PSI2="/Users/hiteshkore/Library/CloudStorage/OneDrive-TheUniversityofMelbourne/Hitesh_parker_lab/Collaborative_projects/RNPS_1/transcript_quantifications/Differential_expression/Bambu_results_HK_latest/splicing_analysis/psi_wt_combined.txt"
+DPSI="/Users/hiteshkore/Library/CloudStorage/OneDrive-TheUniversityofMelbourne/Hitesh_parker_lab/Collaborative_projects/RNPS_1/transcript_quantifications/Differential_expression/Bambu_results_HK_latest/splicing_analysis/combined_delta_psi_wtvsgfp.txt"
+
+events_of_interests="/Users/hiteshkore/Library/CloudStorage/OneDrive-TheUniversityofMelbourne/Hitesh_parker_lab/github/suppa2-event-visualiser/data/events_of_interest.txt"
+
+# Keep headers
+head -n 1 "$IOE" > ./data/selected_events.ioe
+head -n 1 "$PSI1" > ./data/selected_psi_condition1.txt
+head -n 1 "$PSI2" > ./data/selected_psi_condition2.txt
+head -n 1 "$DPSI" > ./data/selected_dpsi.txt
+
+# Extract matching records
+while IFS= read -r event
+do
+    grep -F "$event" "$IOE" >> ./data/selected_events.ioe
+    grep -F "$event" "$PSI1" >> ./data/selected_psi_condition1.txt
+    grep -F "$event" "$PSI2" >> ./data/selected_psi_condition2.txt
+    grep -F "$event" "$DPSI" >>./data/selected_dpsi.txt
+done < "$events_of_interests"

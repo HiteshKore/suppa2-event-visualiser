@@ -1,0 +1,9 @@
+
+.DS_Store
+.Rhistory
+.RData
+.Ruserdata
+#Ignore files
+data_prep_commands.sh
+Visualisation_of_splicing_data.Rproj
+

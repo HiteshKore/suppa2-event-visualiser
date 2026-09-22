@@ -1,0 +1,8 @@
+for i in AF AL A5 A3 MX SE RI ; do
+cat "$i/psi_asp.psi" >> psi_asp_combined.txt
+done
+
+
+for i in AF AL A5 A3 MX SE RI ; do
+cat "$i/"deltapsi_wtvsgfp_*dpsi.txt >>combined_delta_psi.txt ; done
+
