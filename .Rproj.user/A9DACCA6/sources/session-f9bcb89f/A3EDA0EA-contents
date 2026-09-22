@@ -138,7 +138,7 @@ https://pubmed.ncbi.nlm.nih.gov/29571299/
 
 ## Citation
 
-If you use this workflow, please cite:
+
 
 > Trincado JL, Entizne JC, Hysenaj G, Irimia M, et al. (2018). **SUPPA2 provides fast, accurate, and uncertainty-aware differential splicing analysis across multiple conditions.** *Genome Biology*, 19, 40.
 
